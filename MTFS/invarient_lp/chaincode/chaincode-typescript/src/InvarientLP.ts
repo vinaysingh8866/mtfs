@@ -12,16 +12,16 @@ import {
 import { Basket } from "./basket";
 
 const reserveWallet = "reserveWallet";
-const oracleContractName = "OracleContract"; // Assuming the name of the OracleContract when deployed
+const oracleContractName = "OracleContract";
 interface LiquidityProvider {
   user: string;
   amount: number;
-  earnedFees: number; // New field to store earned fees
+  earnedFees: number; 
 }
 @Info({
   title: "AssetCross",
   description:
-    "Smart contract for managing a basket of stablecoins based on Curve DAO",
+    "Smart contract for managing a basket of CBDCs based on Curve DAO",
 })
 export class BasketContract extends Contract {
   @Transaction()
@@ -63,44 +63,79 @@ export class BasketContract extends Contract {
   }
 
   @Transaction()
-  public async CBDCToStablecoin(
+  public async SwapCBDCs(
     ctx: Context,
     amount: number,
-    cbdc: string,
+    fromCBDC: string,
+    toCBDC: string,
     user: string
   ): Promise<string> {
     const basketJSON = await ctx.stub.getState("basket1");
     const basket: Basket = JSON.parse(basketJSON.toString());
-
-    const cbdcIndex = basket.Tokens.indexOf(cbdc);
-    if (cbdcIndex === -1) {
-      throw new Error("Provided CBDC is not supported in the basket.");
+  
+    const fromIndex = basket.Tokens.indexOf(fromCBDC);
+    const toIndex = basket.Tokens.indexOf(toCBDC);
+  
+    if (fromIndex === -1 || toIndex === -1) {
+      throw new Error(
+        "One or both provided CBDCs are not supported in the basket."
+      );
     }
-
-    const stablecoinAmount = amount * basket.Prices[cbdcIndex];
-
-    // TODO: Ensure that the reserves, weights, etc., are updated accordingly.
-
-    const cbdcTransfer = await ctx.stub.invokeChaincode(
+  
+    // Calculate the invariant before the swap
+    let D_before = 0;
+    for (let i = 0; i < basket.Reserves.length; i++) {
+      D_before += basket.Reserves[i];
+      for (let j = 0; j < basket.Reserves.length; j++) {
+        if (i !== j) {
+          D_before *= (1 + basket.Reserves[i] / basket.Reserves[j]);
+        }
+      }
+    }
+  
+    // Update the reserves for the 'from' CBDC
+    basket.Reserves[fromIndex] -= amount;
+  
+    // Calculate the invariant after removing the 'from' CBDC
+    let D_after = 0;
+    for (let i = 0; i < basket.Reserves.length; i++) {
+      D_after += basket.Reserves[i];
+      for (let j = 0; j < basket.Reserves.length; j++) {
+        if (i !== j) {
+          D_after *= (1 + basket.Reserves[i] / basket.Reserves[j]);
+        }
+      }
+    }
+  
+    // Calculate the amount of 'to' CBDC to be added to maintain the invariant
+    const toAmount = D_before - D_after;
+  
+    // Update the reserves for the 'to' CBDC
+    basket.Reserves[toIndex] += toAmount;
+  
+    const fromCBDCDecrease = await ctx.stub.invokeChaincode(
       "alpha",
       ["Transfer", user, reserveWallet, amount.toString()],
       "mychannel"
     );
-    if (cbdcTransfer.status !== 200) {
-      throw new Error("CBDC transfer failed.");
+    if (fromCBDCDecrease.status !== 200) {
+      throw new Error("CBDC transfer from user failed.");
     }
-
-    const stableCoinTransfer = await ctx.stub.invokeChaincode(
-      "gama",
-      ["Transfer", reserveWallet, user, stablecoinAmount.toString()],
+  
+    const toCBDCIncrease = await ctx.stub.invokeChaincode(
+      "alpha",
+      ["Transfer", reserveWallet, user, toAmount.toString()],
       "mychannel"
     );
-    if (stableCoinTransfer.status !== 200) {
-      throw new Error("Stablecoin transfer failed.");
+    if (toCBDCIncrease.status !== 200) {
+      throw new Error("CBDC transfer to user failed.");
     }
-
-    return stableCoinTransfer.payload.toString();
+  
+    await ctx.stub.putState("basket1", Buffer.from(JSON.stringify(basket)));
+  
+    return `Successfully swapped ${amount} ${fromCBDC} for ${toAmount} ${toCBDC}`;
   }
+  
 
   @Transaction()
   public async UpdateReserves(
@@ -116,106 +151,6 @@ export class BasketContract extends Contract {
     basket.Reserves = updatedReserves;
     await ctx.stub.putState("basket1", Buffer.from(JSON.stringify(basket)));
   }
-
-  @Transaction()
-  public async SwapCBDCs(
-    ctx: Context,
-    amount: number,
-    fromCBDC: string,
-    toCBDC: string,
-    user: string
-  ): Promise<string> {
-    const basketJSON = await ctx.stub.getState("basket1");
-    const basket: Basket = JSON.parse(basketJSON.toString());
-
-    const fromIndex = basket.Tokens.indexOf(fromCBDC);
-    const toIndex = basket.Tokens.indexOf(toCBDC);
-
-    if (fromIndex === -1 || toIndex === -1) {
-      throw new Error(
-        "One or both provided CBDCs are not supported in the basket."
-      );
-    }
-
-    const toAmount =
-      amount * (basket.Prices[fromIndex] / basket.Prices[toIndex]);
-
-    const fromCBDCDecrease = await ctx.stub.invokeChaincode(
-      "alpha",
-      ["Transfer", user, reserveWallet, amount.toString()],
-      "mychannel"
-    );
-    if (fromCBDCDecrease.status !== 200) {
-      throw new Error("CBDC transfer from user failed.");
-    }
-
-    const toCBDCIncrease = await ctx.stub.invokeChaincode(
-      "alpha",
-      ["Transfer", reserveWallet, user, toAmount.toString()],
-      "mychannel"
-    );
-    if (toCBDCIncrease.status !== 200) {
-      throw new Error("CBDC transfer to user failed.");
-    }
-
-    // Update reserves accordingly
-    basket.Reserves[fromIndex] -= amount;
-    basket.Reserves[toIndex] += toAmount;
-    await ctx.stub.putState("basket1", Buffer.from(JSON.stringify(basket)));
-
-    return `Successfully swapped ${amount} ${fromCBDC} for ${toAmount} ${toCBDC}`;
-  }
-
-  private async distributeFees(ctx: Context, fee: number): Promise<void> {
-    // Fetch all liquidity providers and their contributions from the LiquidityProviderContract
-    const liquidityProvidersResponse = await ctx.stub.invokeChaincode(
-      "LiquidityProviderContract",
-      ["GetAllLiquidityProviders"],
-      "mychannel"
-    );
-    if (liquidityProvidersResponse.status !== 200) {
-      throw new Error("Failed to fetch liquidity providers.");
-    }
-    const liquidityProviders: LiquidityProvider[] = JSON.parse(
-      liquidityProvidersResponse.payload.toString()
-    );
-
-    let totalLiquidity = 0;
-    for (const provider of liquidityProviders) {
-      totalLiquidity += provider.amount;
-    }
-
-    for (const provider of liquidityProviders) {
-      const distributionAmount = (provider.amount / totalLiquidity) * fee;
-      // Update the earned fees for the liquidity provider
-      await ctx.stub.invokeChaincode(
-        "LiquidityProviderContract",
-        ["UpdateEarnedFees", provider.user, distributionAmount.toString()],
-        "mychannel"
-      );
-    }
-  }
-
-  private async getLiquidityProviders(
-    ctx: Context
-  ): Promise<{ user: string; amount: number }[]> {
-    const liquidityProvidersResponse = await ctx.stub.invokeChaincode(
-      "LiquidityProviderContract",
-      ["GetAllLiquidityProviders"],
-      "mychannel"
-    );
-    if (liquidityProvidersResponse.status !== 200) {
-      throw new Error("Failed to fetch liquidity providers.");
-    }
-    const liquidityProviders: LiquidityProvider[] = JSON.parse(
-      liquidityProvidersResponse.payload.toString()
-    );
-
-    return liquidityProviders.map((provider) => {
-      return { user: provider.user, amount: provider.amount };
-    });
-  }
-  
 
   @Transaction()
   public async AddLiquidity(
@@ -245,11 +180,10 @@ export class BasketContract extends Contract {
       basket.Reserves[i] += amounts[i];
     }
 
-    // Distribute fees if needed and update the user's liquidity position
-
     await ctx.stub.putState("basket1", Buffer.from(JSON.stringify(basket)));
   }
 
+  
   @Transaction()
   public async RemoveLiquidity(
     ctx: Context,
@@ -288,4 +222,49 @@ export class BasketContract extends Contract {
 
     await ctx.stub.putState("basket1", Buffer.from(JSON.stringify(basket)));
   }
+
+  // Assuming a fee distribution mechanism
+  private async distributeFees(ctx: Context, fee: number): Promise<void> {
+    // Fetch all liquidity providers and their contributions
+    // For this example, I'm assuming a function that gets all liquidity providers. You might need to adjust this based on your actual data structure.
+    const liquidityProviders = await this.getLiquidityProviders(ctx);
+
+    let totalLiquidity = 0;
+    for (const provider of liquidityProviders) {
+      totalLiquidity += provider.amount;
+    }
+
+    for (const provider of liquidityProviders) {
+      const distributionAmount = (provider.amount / totalLiquidity) * fee;
+      // Update the earned fees for the liquidity provider
+      // Again, you might need to adjust this based on your actual data structure and logic.
+      await ctx.stub.invokeChaincode(
+        "LiquidityProviderContract",
+        ["UpdateEarnedFees", provider.user, distributionAmount.toString()],
+        "mychannel"
+      );
+    }
+  }
+  
+  private async getLiquidityProviders(
+    ctx: Context
+  ): Promise<{ user: string; amount: number }[]> {
+    const liquidityProvidersResponse = await ctx.stub.invokeChaincode(
+      "LiquidityProviderContract",
+      ["GetAllLiquidityProviders"],
+      "mychannel"
+    );
+    if (liquidityProvidersResponse.status !== 200) {
+      throw new Error("Failed to fetch liquidity providers.");
+    }
+    const liquidityProviders: LiquidityProvider[] = JSON.parse(
+      liquidityProvidersResponse.payload.toString()
+    );
+
+    return liquidityProviders.map((provider) => {
+      return { user: provider.user, amount: provider.amount };
+    });
+  }
+
+  
 }
