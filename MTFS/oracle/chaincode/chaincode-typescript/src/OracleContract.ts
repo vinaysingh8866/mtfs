@@ -14,6 +14,8 @@ import {
   title: "OracleContract",
   description: "Oracle Smart contract for managing currency prices",
 })
+
+
 export class OracleContract extends Contract {
   private static readonly AUTHORIZED_MSP = "TrustedOrgMSP"; // Replace with your authorized MSP ID
 

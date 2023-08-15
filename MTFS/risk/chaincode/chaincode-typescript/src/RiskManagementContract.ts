@@ -1,5 +1,16 @@
 import { Context, Contract, Info, Returns, Transaction } from 'fabric-contract-api';
 
+interface Basket {
+    docType?: string;
+    ID: string;
+    TokenAmount: number;
+    Tokens: string[];
+    Reserves: number[];
+    Buffers: number[];
+    Weights: number[];
+    Prices: number[];
+  }
+  
 @Info({ title: 'RiskManagement', description: 'Risk management chaincode for the basket contract' })
 export class RiskManagementContract extends Contract {
 
@@ -41,15 +52,40 @@ export class RiskManagementContract extends Contract {
         return true;  // no overexposure detected
     }
 
-    // This is a placeholder. In reality, you'd compute volatility from historical data
-    // or fetch it from some trusted source.
+  
     @Transaction(false)
     @Returns('boolean')
-    public async CheckAssetVolatility(ctx: Context): Promise<boolean> {
-        // Here, you'd fetch volatility data for each asset and check if it's within acceptable bounds.
-        // If any asset has too high volatility, return false.
-        
-        return true;  // assume all assets have acceptable volatility for now
+    public async CheckAssetVolatility(ctx: Context, volatilityThreshold: number = 0.05, oracleContractName): Promise<boolean> {
+        const basketJSON = await ctx.stub.getState('basket1');
+        const basket: Basket = JSON.parse(basketJSON.toString());
+    
+        for (let i = 0; i < basket.Tokens.length; i++) {
+            const currentPriceResponse = await ctx.stub.invokeChaincode(
+                oracleContractName,
+                ["GetCurrencyPrice", basket.Tokens[i]],
+                "mychannel"
+            );
+            const previousPriceResponse = await ctx.stub.invokeChaincode(
+                oracleContractName,
+                ["GetPreviousCurrencyPrice", basket.Tokens[i]],
+                "mychannel"
+            );
+    
+            if (currentPriceResponse.status !== 200 || previousPriceResponse.status !== 200) {
+                throw new Error(`Failed to fetch prices for ${basket.Tokens[i]}`);
+            }
+    
+            const currentPrice = parseFloat(currentPriceResponse.payload.toString());
+            const previousPrice = parseFloat(previousPriceResponse.payload.toString());
+    
+            const change = Math.abs((currentPrice - previousPrice) / previousPrice);
+            if (change > volatilityThreshold) {
+                return false;  // Asset is volatile
+            }
+        }
+    
+        return true;  // No assets found to be volatile
     }
+    
 
 }
